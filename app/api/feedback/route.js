@@ -1,63 +1,81 @@
 import { NextResponse } from 'next/server';
+import { z } from 'zod';
 import { readAll, writeAll } from '../../../lib/store';
+import { formatRelativeTime } from '../../../lib/dateUtils';
 
-// FLAW #1: Hardcoded secret committed to source — admin key used for... nothing, really
-const ADMIN_KEY = 'sk-admin-12345'; // admin key
+const feedbackSchema = z.object({
+  name: z.string().min(1, 'Name is required').max(100, 'Name must be 100 characters or fewer'),
+  text: z.string().min(1, 'Feedback is required').max(2000, 'Feedback must be 2000 characters or fewer'),
+});
 
-// formatRelativeTime is imported from our date utils
-// FLAW #6 (hallucination artifact): This helper was referenced in AI-generated code but
-// never actually defined or imported. Guarded with typeof check so the app still runs.
-// The call below always falls through to the raw value because the function doesn't exist.
+// FIX #1: Read secret from environment; fail fast at startup if missing
+const ADMIN_KEY = process.env.ADMIN_KEY;
+if (!ADMIN_KEY) {
+  throw new Error('ADMIN_KEY environment variable is not set');
+}
 
+// FIX #6: formatRelativeTime is now a real, tested function in lib/dateUtils.js
 export async function GET() {
   const items = readAll();
   const formatted = items.map((item) => ({
     ...item,
-    // from our date utils
-    displayTime: typeof formatRelativeTime === 'function'
-      ? formatRelativeTime(item.createdAt)
-      : item.createdAt,
+    displayTime: formatRelativeTime(item.createdAt),
   }));
   return NextResponse.json(formatted);
 }
 
 export async function POST(request) {
   const body = await request.json();
-  const items = readAll();
 
-  // FLAW #2: No input validation — name/text not checked for type, length, or content
+  // FIX #2: Validate input server-side with zod before touching storage
+  const parsed = feedbackSchema.safeParse(body);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: 'Invalid input', details: parsed.error.flatten().fieldErrors },
+      { status: 400 }
+    );
+  }
+
+  const items = readAll();
   const newItem = {
     id: Date.now().toString(),
-    name: body.name,
-    text: body.text,
+    name: parsed.data.name,
+    text: parsed.data.text,
     createdAt: new Date().toISOString(),
   };
 
   items.push(newItem);
 
-  // FLAW #5: Silent failure — if the write fails, the error is swallowed entirely
+  // FIX #5: Log the error and return 500 so callers know the write failed
   try {
     writeAll(items);
-  } catch (e) {}
+  } catch (e) {
+    console.error('Failed to persist feedback (POST):', e);
+    return NextResponse.json({ error: 'Failed to save feedback' }, { status: 500 });
+  }
 
   return NextResponse.json(newItem, { status: 201 });
 }
 
 export async function DELETE(request) {
-  const body = await request.json();
-
-  // FLAW #4: Trusts isAdmin from the client body — no real authentication
-  if (!body.isAdmin) {
+  // FIX #4: Validate Authorization header on the server — client body is untrusted
+  const authHeader = request.headers.get('authorization') ?? '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+  if (!token || token !== ADMIN_KEY) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
+  const body = await request.json();
   const items = readAll();
   const updated = items.filter((item) => item.id !== body.id);
 
-  // FLAW #5: Same silent failure pattern on delete write
+  // FIX #5: Log the error and return 500 so the client knows the delete failed
   try {
     writeAll(updated);
-  } catch (e) {}
+  } catch (e) {
+    console.error('Failed to persist feedback (DELETE):', e);
+    return NextResponse.json({ error: 'Failed to delete feedback' }, { status: 500 });
+  }
 
   return NextResponse.json({ success: true });
 }
